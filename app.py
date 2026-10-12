@@ -1321,12 +1321,29 @@ _TAKIM_GEREKSIZ_KELIMELER = {"fk", "jk", "sk", "as", "a.s.", "kulubu", "spor", "
                              "sportif", "faaliyetler", "club", "fc", "1965"}
 
 
+# Farklı sağlayıcıların AYNI takım için kullandığı, normalize ile eşleşmeyen
+# adlar. Anahtar: normalize edilmiş eski ad; değer: sitede kullanılacak tek ad.
+TAKIM_AD_ESLESTIRME = {
+    "erzurumspor": "Erzurum BB",   # Erzurumspor FK == Erzurum BB
+}
+
+
 def takim_adi_normalize(ad):
     """'Beşiktaş JK', 'Besiktas', 'Başakşehir FK', 'Istanbul Basaksehir' gibi
     farklı yazımları karşılaştırılabilir hale getirir."""
     ad = (ad or "").translate(_TR_HARF).lower().replace("-", " ").replace(".", " ")
     kelimeler = [k for k in ad.split() if k and k not in _TAKIM_GEREKSIZ_KELIMELER]
-    return " ".join(kelimeler) or ad.strip()
+    sonuc = " ".join(kelimeler) or ad.strip()
+    if sonuc in TAKIM_AD_ESLESTIRME:
+        return takim_adi_normalize(TAKIM_AD_ESLESTIRME[sonuc])
+    return sonuc
+
+
+def kanonik_takim_adi(ad):
+    """Eşleştirme tablosundaki eski adı sitede kullanılan tek ada çevirir."""
+    ad = (ad or "").translate(_TR_HARF).lower().replace("-", " ").replace(".", " ")
+    kelimeler = [k for k in ad.split() if k and k not in _TAKIM_GEREKSIZ_KELIMELER]
+    return TAKIM_AD_ESLESTIRME.get(" ".join(kelimeler))
 
 
 def takimlar_ayni_mi(a, b):
@@ -1396,11 +1413,13 @@ def sync_super_lig_espn(requested_season=None, aylar=None):
     bilinen_adlar = {}
     for m in mevcut_maclar:
         for ad in (m.ev_sahibi, m.deplasman):
-            if ad:
+            if ad and not kanonik_takim_adi(ad):
                 bilinen_adlar.setdefault(takim_adi_normalize(ad), ad)
 
     def turkce_ad(espn_adi):
         n = takim_adi_normalize(espn_adi)
+        if kanonik_takim_adi(espn_adi):
+            return kanonik_takim_adi(espn_adi)
         if n in bilinen_adlar:
             return bilinen_adlar[n]
         for norm, ad in bilinen_adlar.items():
@@ -1821,6 +1840,52 @@ def recalculate_all_points():
 # DATABASE INITIALIZATION (Auto-run safely for Vercel)
 # ============================================================
 
+def takim_adlarini_birlestir():
+    """TAKIM_AD_ESLESTIRME'deki eski adları (ör. 'Erzurumspor FK') veritabanından
+    temizler. Aynı maçın yeni adlı kopyası varsa eski kopya silinir (tahminleri
+    yeni kopyaya taşınır); yoksa sadece takım adı değiştirilir."""
+    eski_maclar = []
+    for m in Mac.query.all():
+        if kanonik_takim_adi(m.ev_sahibi) or kanonik_takim_adi(m.deplasman):
+            eski_maclar.append(m)
+    if not eski_maclar:
+        return
+    silinen = yeniden_adlandirilan = 0
+    for eski in eski_maclar:
+        yeni_ev = kanonik_takim_adi(eski.ev_sahibi) or eski.ev_sahibi
+        yeni_dep = kanonik_takim_adi(eski.deplasman) or eski.deplasman
+        kopya = None
+        if eski.baslangic:
+            adaylar = Mac.query.filter(
+                Mac.id != eski.id, Mac.lig_id == eski.lig_id,
+                Mac.ev_sahibi == yeni_ev, Mac.deplasman == yeni_dep,
+            ).all()
+            for a in adaylar:
+                if a.baslangic and abs((a.baslangic - eski.baslangic).total_seconds()) <= 3 * 24 * 3600:
+                    kopya = a
+                    break
+        if kopya is None:
+            eski.ev_sahibi, eski.deplasman = yeni_ev, yeni_dep
+            yeniden_adlandirilan += 1
+            continue
+        # Tahminleri kopyaya taşı (aynı kişinin aynı grupta zaten tahmini varsa eskisini at)
+        for t in Tahmin.query.filter_by(mac_id=eski.id).all():
+            var = Tahmin.query.filter_by(mac_id=kopya.id, grup_id=t.grup_id,
+                                         kullanici_id=t.kullanici_id).first()
+            if var:
+                db.session.delete(t)
+            else:
+                t.mac_id = kopya.id
+        db.session.flush()
+        MacMuafiyet.query.filter_by(mac_id=eski.id).delete()
+        MacSaatDuzeltme.query.filter_by(mac_id=eski.id).delete()
+        db.session.delete(eski)
+        silinen += 1
+    db.session.commit()
+    if silinen or yeniden_adlandirilan:
+        print(f"[takim_adlarini_birlestir] silinen kopya: {silinen}, ad değişen: {yeniden_adlandirilan}")
+
+
 def initialize_database():
     with app.app_context():
         db.create_all()
@@ -1840,6 +1905,10 @@ def initialize_database():
                 db.session.commit()
             except Exception:
                 db.session.rollback()
+        try:
+            takim_adlarini_birlestir()
+        except Exception:
+            db.session.rollback()
         admin_username = os.getenv("ADMIN_USERNAME", "admin")
         admin_password = os.getenv("ADMIN_PASSWORD", "Admin123!")
 
@@ -3296,7 +3365,8 @@ def lig_puan_tablosu_hesapla(lig_id):
             t["logo"] = logo
         return t
     for m in maclar:
-        ev, dep = satir(m.ev_sahibi, m.ev_logo), satir(m.deplasman, m.deplasman_logo)
+        ev = satir(kanonik_takim_adi(m.ev_sahibi) or m.ev_sahibi, m.ev_logo)
+        dep = satir(kanonik_takim_adi(m.deplasman) or m.deplasman, m.deplasman_logo)
         for t, at, ye in ((ev, m.ev_skor, m.deplasman_skor), (dep, m.deplasman_skor, m.ev_skor)):
             t["o"] += 1; t["ag"] += at; t["yg"] += ye
             sonuc = "G" if at > ye else ("B" if at == ye else "M")
