@@ -55,6 +55,7 @@
         <td>
           <div class="oyuncu">
             {{ row.user.kullanici_adi if row.user else "?" }}
+            {% if row.user and yz_mi(row.user) %}<span class="etiket etiket-yz" title="İstatistik modeliyle tahmin yapan bot oyuncu">🤖 bot</span>{% endif %}
             {% if lider %}<span class="etiket etiket-kral"><span class="kart-isaret sari" aria-hidden="true"></span>{{ kral_yazisi }} 👑</span>{% endif %}
             {% if sonuncu %}<span class="etiket etiket-cenabet"><span class="kart-isaret kirmizi" aria-hidden="true"></span>{{ cenabet_yazisi }} 💩</span>{% endif %}
           </div>

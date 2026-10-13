@@ -1946,7 +1946,7 @@ def kayit():
             flash("Form bilgilerini kontrol edin (Şifre en az 6 karakter olmalı ve uyuşmalı).", "danger")
             return redirect(url_for("kayit", next=next_url) if next_url else url_for("kayit"))
 
-        if Kullanici.query.filter_by(kullanici_adi=kullanici_adi).first():
+        if kullanici_adi.casefold() in {YZ_KULLANICI_ADI.casefold(), "yapay zeka"} or Kullanici.query.filter_by(kullanici_adi=kullanici_adi).first():
             flash("Bu kullanıcı adı zaten kullanılıyor.", "danger")
             return redirect(url_for("kayit", next=next_url) if next_url else url_for("kayit"))
 
@@ -1967,7 +1967,7 @@ def giris():
         kullanici_adi = request.form.get("kullanici_adi", "").strip()
         sifre = request.form.get("sifre", "")
         user = Kullanici.query.filter_by(kullanici_adi=kullanici_adi).first()
-        if user and user.check_password(sifre):
+        if user and not yz_mi(user) and user.check_password(sifre):
             login_user(user)
             return redirect(request.args.get("next") or url_for("dashboard"))
         flash("Kullanıcı adı veya şifre hatalı.", "danger")
@@ -2035,6 +2035,10 @@ def grup_olustur():
     db.session.add(grup)
     db.session.flush()
     db.session.add(GrupUyeligi(grup_id=grup.id, kullanici_id=current_user.id))
+    try:
+        db.session.add(GrupUyeligi(grup_id=grup.id, kullanici_id=yz_kullanici_getir().id))
+    except Exception:
+        pass
     db.session.commit()
     flash("Grup oluşturuldu.", "success")
     return redirect(url_for("grup", grup_id=grup.id))
@@ -3045,6 +3049,9 @@ def takim_logo_url(takim_adi, mevcut_logo=None):
 app.jinja_env.globals["takim_logo_url"] = takim_logo_url
 
 
+app.jinja_env.globals['yz_mi'] = lambda k: yz_mi(k)
+
+
 @app.context_processor
 def sohbet_rozeti():
     """Alt menüdeki Sohbet sekmesinin okunmamış rozeti (sadece girişli kullanıcıda, tek sorgu)."""
@@ -3435,18 +3442,165 @@ def sonucu_beklenen_maclar(now=None):
     ).all()
 
 
+# ============================================================
+# YAPAY ZEKÂ OYUNCU
+# Her gruba otomatik katılan, istatistik modeliyle (Poisson) tahmin yapan
+# bot oyuncu. Ücretsizdir: dış API çağırmaz, sadece veritabanındaki biten
+# maçlara bakar. Tahminleri normal oyuncular gibi puanlanır.
+# ============================================================
+
+YZ_KULLANICI_ADI = "Yapay Zekâ"
+YZ_TAHMIN_PENCERESI_GUN = 7       # bu kadar gün içindeki maçlara tahmin girer
+YZ_GECMIS_GUN = 400               # modelin baktığı geçmiş
+YZ_ONSEL_MAC = 4                  # az maçı olan takımı lig ortalamasına çeker
+YZ_MAX_GOL = 6
+
+
+def yz_kullanici_getir(olustur=True):
+    kullanici = Kullanici.query.filter_by(kullanici_adi=YZ_KULLANICI_ADI).first()
+    if kullanici or not olustur:
+        return kullanici
+    import secrets
+    kullanici = Kullanici(kullanici_adi=YZ_KULLANICI_ADI)
+    kullanici.set_password(secrets.token_urlsafe(48))  # kimse giriş yapamaz
+    db.session.add(kullanici)
+    db.session.flush()
+    return kullanici
+
+
+def yz_mi(kullanici):
+    return bool(kullanici) and kullanici.kullanici_adi == YZ_KULLANICI_ADI
+
+
+def yz_gruplara_ekle(yz=None):
+    """YZ'yi üyesi olmadığı tüm gruplara ekler. Eklenen grup sayısını döner."""
+    yz = yz or yz_kullanici_getir()
+    mevcut = {gid for (gid,) in db.session.query(GrupUyeligi.grup_id).filter_by(kullanici_id=yz.id).all()}
+    eklenen = 0
+    for (gid,) in db.session.query(Grup.id).all():
+        if gid not in mevcut:
+            db.session.add(GrupUyeligi(grup_id=gid, kullanici_id=yz.id))
+            eklenen += 1
+    return eklenen
+
+
+def _poisson(k, lam):
+    import math
+    return math.exp(-lam) * lam ** k / math.factorial(k)
+
+
+def _yz_lig_istatistigi(lig_id, simdi):
+    """Ligin geçmiş maçlarından takım bazında atılan/yenilen gol ortalamaları."""
+    maclar = Mac.query.filter(
+        Mac.lig_id == lig_id, Mac.durum == "bitti",
+        Mac.ev_skor.isnot(None), Mac.deplasman_skor.isnot(None),
+        Mac.baslangic.isnot(None), Mac.baslangic >= simdi - timedelta(days=YZ_GECMIS_GUN),
+    ).all()
+    if lig_id == SUPER_LIG_ID:
+        espn = [m for m in maclar if m.external_id and m.external_id >= ESPN_EXTERNAL_ID_OFFSET]
+        if espn:
+            maclar = espn
+
+    if len(maclar) >= 10:
+        ev_ort = sum(m.ev_skor for m in maclar) / len(maclar)
+        dep_ort = sum(m.deplasman_skor for m in maclar) / len(maclar)
+    else:
+        ev_ort, dep_ort = 1.5, 1.15
+    ev_ort, dep_ort = max(ev_ort, 0.5), max(dep_ort, 0.4)
+
+    takimlar = {}
+    for m in maclar:
+        for ad, atti, yedi in ((m.ev_sahibi, m.ev_skor, m.deplasman_skor), (m.deplasman, m.deplasman_skor, m.ev_skor)):
+            t = takimlar.setdefault(takim_adi_normalize(ad), [0, 0, 0])
+            t[0] += 1; t[1] += atti; t[2] += yedi
+    return {"ev_ort": ev_ort, "dep_ort": dep_ort, "takimlar": takimlar}
+
+
+def yz_skor_tahmini(mac, istatistik):
+    """Beklenen puanı (5 tam skor / 3 doğru sonuç) en yüksek skoru seçer."""
+    ort = (istatistik["ev_ort"] + istatistik["dep_ort"]) / 2
+
+    def guc(ad):
+        o, atti, yedi = istatistik["takimlar"].get(takim_adi_normalize(ad), (0, 0, 0))
+        hucum = (atti + YZ_ONSEL_MAC * ort) / (o + YZ_ONSEL_MAC) / ort
+        savunma = (yedi + YZ_ONSEL_MAC * ort) / (o + YZ_ONSEL_MAC) / ort
+        return hucum, savunma
+
+    ev_h, ev_s = guc(mac.ev_sahibi)
+    dep_h, dep_s = guc(mac.deplasman)
+    lam_ev = min(max(istatistik["ev_ort"] * ev_h * dep_s, 0.2), 4.5)
+    lam_dep = min(max(istatistik["dep_ort"] * dep_h * ev_s, 0.2), 4.5)
+
+    olasilik = {(i, j): _poisson(i, lam_ev) * _poisson(j, lam_dep)
+                for i in range(YZ_MAX_GOL) for j in range(YZ_MAX_GOL)}
+    sonuc_olasiligi = {1: 0.0, 0: 0.0, -1: 0.0}
+    for (i, j), p in olasilik.items():
+        sonuc_olasiligi[(i > j) - (i < j)] += p
+    en_iyi = max(olasilik, key=lambda s: 2 * olasilik[s] + 3 * sonuc_olasiligi[(s[0] > s[1]) - (s[0] < s[1])])
+    return en_iyi
+
+
+def yz_tahminleri_uret():
+    """Önümüzdeki günlerdeki maçlara, YZ'nin tahmini olmayan her grup için tahmin girer."""
+    simdi = utc_now_naive()
+    yz = yz_kullanici_getir()
+    eklenen_grup = yz_gruplara_ekle(yz)
+    grup_idleri = [gid for (gid,) in db.session.query(GrupUyeligi.grup_id).filter_by(kullanici_id=yz.id).all()]
+
+    maclar = Mac.query.filter(
+        Mac.lig_id.in_(gosterilecek_lig_id_listesi()),
+        Mac.baslangic.isnot(None),
+        Mac.baslangic > simdi,
+        Mac.baslangic <= simdi + timedelta(days=YZ_TAHMIN_PENCERESI_GUN),
+        ~Mac.durum.in_(["bitti", "iptal", "ertelendi"]),
+        super_lig_takim_filtresi(),
+    ).all()
+    if not maclar or not grup_idleri:
+        db.session.commit()
+        return {"gruba_eklendi": eklenen_grup, "yeni_tahmin": 0}
+
+    var_olan = set(
+        db.session.query(Tahmin.grup_id, Tahmin.mac_id)
+        .filter(Tahmin.kullanici_id == yz.id, Tahmin.mac_id.in_([m.id for m in maclar]))
+        .all()
+    )
+    istatistikler = {}
+    yeni = 0
+    for mac in maclar:
+        eksik = [gid for gid in grup_idleri if (gid, mac.id) not in var_olan]
+        if not eksik:
+            continue
+        if mac.lig_id not in istatistikler:
+            istatistikler[mac.lig_id] = _yz_lig_istatistigi(mac.lig_id, simdi)
+        ev, dep = yz_skor_tahmini(mac, istatistikler[mac.lig_id])
+        for gid in eksik:
+            db.session.add(Tahmin(grup_id=gid, mac_id=mac.id, kullanici_id=yz.id, ev_skor=ev, deplasman_skor=dep))
+            yeni += 1
+    db.session.commit()
+    return {"gruba_eklendi": eklenen_grup, "yeni_tahmin": yeni}
+
+
+def _yz_guvenli_calistir():
+    try:
+        return yz_tahminleri_uret()
+    except Exception as e:
+        db.session.rollback()
+        return {"success": False, "error": str(e)}
+
+
 def akilli_senkron():
     now = utc_now_naive()
+    yz_sonuc = _yz_guvenli_calistir()
 
     son_tam = _senkron_zamani_oku("tam")
     if son_tam is None or (now - son_tam) >= timedelta(hours=TAM_SENKRON_ARALIK_SAAT):
         sonuclar = sync_all_leagues()
         _senkron_zamani_yaz("tam")
-        return {"tur": "tam (günlük)", "sonuclar": sonuclar}
+        return {"tur": "tam (günlük)", "sonuclar": sonuclar, "yapay_zeka": yz_sonuc}
 
     bekleyenler = sonucu_beklenen_maclar(now)
     if not bekleyenler:
-        return {"tur": "atlandı", "mesaj": "Sonucu beklenen maç yok, API'ye gidilmedi."}
+        return {"tur": "atlandı", "mesaj": "Sonucu beklenen maç yok, API'ye gidilmedi.", "yapay_zeka": yz_sonuc}
 
     lig_id_to_kod = {bilgi["id"]: kod for kod, bilgi in LEAGUES.items()}
     lig_aylari = {}
@@ -3468,6 +3622,7 @@ def akilli_senkron():
         "tur": "bekleyen maçlar",
         "bekleyen": [f"{m.ev_sahibi} - {m.deplasman}" for m in bekleyenler],
         "sonuclar": sonuclar,
+        "yapay_zeka": yz_sonuc,
     }
 
 
@@ -3491,7 +3646,7 @@ def cron_sync():
         try:
             sonuclar = sync_all_leagues()
             _senkron_zamani_yaz("tam")
-            return jsonify({"tur": "tam", "sonuclar": sonuclar}), 200
+            return jsonify({"tur": "tam", "sonuclar": sonuclar, "yapay_zeka": _yz_guvenli_calistir()}), 200
         except Exception as e:
             db.session.rollback()
             return jsonify({"success": False, "error": str(e)}), 500
